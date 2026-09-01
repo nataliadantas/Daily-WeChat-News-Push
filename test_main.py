@@ -196,6 +196,13 @@ class RewritePipelineTests(unittest.TestCase):
             {"items": []},
         )
 
+    def test_batched_splits_large_target_into_small_requests(self):
+        with patch("main.process_section", return_value='<article>x</article>') as ps:
+            html = main.process_section_batched("全球综合重大新闻", ["a", "b", "c"], 12, "2026年8月31日")
+
+        self.assertEqual(ps.call_count, 3)
+        self.assertEqual(html.count("<article>"), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

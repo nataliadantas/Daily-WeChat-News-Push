@@ -331,6 +331,24 @@ def process_section(section_name, search_query, target_count, yesterday_str):
         return '<p style="color:#888;">本板块暂未获得可验证的新闻。</p>'
     return "".join(html_items)
 
+
+BATCH_SIZE = 4
+
+
+def process_section_batched(section_name, search_queries, target_count, yesterday_str):
+    """分批让模型搜索并撰写，每批最多 BATCH_SIZE 条，避免单次请求过重超时。"""
+    remaining = max(int(target_count), 0)
+    parts = []
+    for query in search_queries:
+        if remaining <= 0:
+            break
+        batch = min(BATCH_SIZE, remaining)
+        parts.append(process_section(section_name, query, batch, yesterday_str))
+        remaining -= batch
+    content = "".join(parts)
+    return content or '<p style="color:#888;">本板块暂未获得可验证的新闻。</p>'
+
+
 def build_final_html(today_str, yesterday_str, sections_data, market_data):
     """流水线组装：将所有写好的板块与真实金融行情拼接为完整 HTML"""
     html_parts = []
@@ -427,7 +445,16 @@ def main():
 
     done_count = sum(s.count("<article") for s in sections_data.values())
     world_target = max(20 - done_count, 0)
-    sections_data["四、全球综合重大新闻"] = process_section("全球综合重大新闻", "world news", world_target, yesterday_str)
+    world_queries = [
+        "world news politics economy",
+        "world news science technology climate",
+        "world news business energy market",
+        "world news society culture health",
+        "world news international affairs diplomacy",
+    ]
+    sections_data["四、全球综合重大新闻"] = process_section_batched(
+        "全球综合重大新闻", world_queries, world_target, yesterday_str
+    )
 
     total_articles = sum(s.count("<article") for s in sections_data.values())
     print(f"本次共生成新闻 {total_articles} 条（目标 20 条）")
