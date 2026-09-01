@@ -1,0 +1,36 @@
+name: Daily WeChat News Push
+
+on:
+  schedule:
+    # 每天北京时间早上 08:00（即 UTC 00:00）全自动触发
+    - cron: '0 0 * * *'
+  workflow_dispatch: # 支持网页手动立即运行
+
+jobs:
+  run-daily-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 安装依赖
+        run: |
+          pip install -r requirements.txt
+
+      - name: 验证新闻新鲜度与行情解析
+        run: |
+          python -m unittest -v test_main.py
+
+      - name: 运行新闻生成与推送脚本
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: gpt-5.6-sol
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+        run: |
+          python main.py
