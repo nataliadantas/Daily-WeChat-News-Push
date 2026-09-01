@@ -232,22 +232,24 @@ def _extract_response_text_and_sources(data):
     if isinstance(data.get("output_text"), str):
         text_parts.append(data["output_text"])
 
+    def collect_urls(value):
+        if isinstance(value, dict):
+            if isinstance(value.get("url"), str):
+                source_urls.add(value["url"])
+            for nested in value.values():
+                collect_urls(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                collect_urls(nested)
+
+    collect_urls(data)
     for output in data.get("output", []):
         if not isinstance(output, dict):
             continue
-        action = output.get("action")
-        if isinstance(action, dict):
-            for source in action.get("sources", []):
-                if isinstance(source, dict) and source.get("url"):
-                    source_urls.add(source["url"])
         for content in output.get("content", []):
-            if not isinstance(content, dict):
-                continue
-            if content.get("type") == "output_text" and isinstance(content.get("text"), str):
-                text_parts.append(content["text"])
-            for annotation in content.get("annotations", []):
-                if isinstance(annotation, dict) and annotation.get("url"):
-                    source_urls.add(annotation["url"])
+            if isinstance(content, dict) and content.get("type") == "output_text":
+                if isinstance(content.get("text"), str):
+                    text_parts.append(content["text"])
 
     output_text = "\n".join(dict.fromkeys(text_parts)).strip()
     if not output_text:
@@ -324,13 +326,26 @@ def _matches_source_domain(article_url, source_url):
     )
 
 
-def _is_cited_original_url(url, cited_urls):
-    key = _canonical_url_key(url)
-    return key is not None and key in {
-        cited_key
+def _is_cited_original_url(url, source_url, cited_urls):
+    """允许引用 URL 有追踪参数或路径差异，但必须来自候选媒体官网。"""
+    if not _matches_source_domain(url, source_url):
+        return False
+    article_key = _canonical_url_key(url)
+    source_key = _canonical_url_key(source_url)
+    if article_key is None or source_key is None:
+        return False
+    article_host, _ = article_key
+    source_host, _ = source_key
+    cited_hosts = {
+        cited_key[0]
         for cited_url in cited_urls
         if (cited_key := _canonical_url_key(cited_url)) is not None
     }
+    return (
+        article_host in cited_hosts
+        or source_host in cited_hosts
+        or any(article_host.endswith(f".{host}") for host in cited_hosts)
+    )
 
 
 def _parse_json_response(text):
@@ -379,8 +394,14 @@ def process_section(section_name, raw_items, target_count, yesterday_str):
 {{"items":[{{"id":0,"title_cn":"中文标题","summary_cn":"正文缩写","original_url":"https://媒体原站/文章"}}]}}
     """
 
-    response_text, cited_urls = call_gpt_web_rewrite(prompt)
-    result = _parse_json_response(response_text)
+    try:
+        response_text, cited_urls = call_gpt_web_rewrite(prompt)
+        result = _parse_json_response(response_text)
+    except (RuntimeError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        print(f"⚠️ {section_name} 联网检索或结果解析失败：{exc}")
+        return '<p style="color:#888;">本板块暂未获得可验证的正文报道。</p>'
+
+    print(f"🔎 {section_name}：候选 {len(raw_items)} 条，联网引用 {len(cited_urls)} 条")
     rewritten_items = result.get("items")
     if not isinstance(rewritten_items, list):
         raise ValueError(f"{section_name} 的模型结果缺少 items 数组")
@@ -402,8 +423,11 @@ def process_section(section_name, raw_items, target_count, yesterday_str):
             or not summary_cn
             or len(title_cn) > 40
             or len(summary_cn) > 220
-            or not _is_cited_original_url(original_url, cited_urls)
-            or not _matches_source_domain(original_url, original.get("source_url", ""))
+            or not _is_cited_original_url(
+                original_url,
+                original.get("source_url", ""),
+                cited_urls,
+            )
         ):
             continue
 
@@ -425,7 +449,8 @@ def process_section(section_name, raw_items, target_count, yesterday_str):
             break
 
     if not html_items:
-        raise ValueError(f"{section_name} 没有可验证的模型输出")
+        print(f"⚠️ {section_name} 没有通过正文、媒体域名和联网引用校验的结果")
+        return '<p style="color:#888;">本板块暂未获得可验证的正文报道。</p>'
     return "".join(html_items)
 
 def build_final_html(today_str, yesterday_str, sections_data, market_data):

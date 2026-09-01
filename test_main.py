@@ -197,6 +197,15 @@ class DataFreshnessTests(unittest.TestCase):
         self.assertEqual(output_text, '{"items":[]}')
         self.assertIn("https://reuters.com/world/original", sources)
 
+    def test_citation_tracking_parameters_do_not_reject_valid_media_url(self):
+        self.assertTrue(
+            main._is_cited_original_url(
+                "https://www.reuters.com/world/article-123?utm_source=search",
+                "https://www.reuters.com",
+                {"https://reuters.com/world/article-123?ref=web_search"},
+            )
+        )
+
     def test_uncited_original_url_is_rejected(self):
         raw_items = [{
             "title": "Original headline",
@@ -215,8 +224,9 @@ class DataFreshnessTests(unittest.TestCase):
             "main.call_gpt_web_rewrite",
             return_value=(model_result, {"https://fake.example/article"}),
         ):
-            with self.assertRaisesRegex(ValueError, "没有可验证"):
-                main.process_section("测试", raw_items, 1, "2026年08月31日")
+            section_html = main.process_section("测试", raw_items, 1, "2026年08月31日")
+
+        self.assertIn("暂未获得可验证", section_html)
 
 
 if __name__ == "__main__":
