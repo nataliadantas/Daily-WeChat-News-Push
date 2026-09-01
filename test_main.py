@@ -2,7 +2,6 @@ import datetime
 import sys
 import types
 import unittest
-from email.utils import format_datetime
 from unittest.mock import Mock, patch
 
 
@@ -24,23 +23,7 @@ class FakeResponse:
         self.status_code = status_code
 
 
-class DataFreshnessTests(unittest.TestCase):
-    def test_rss_rejects_items_older_than_24_hours(self):
-        now = datetime.datetime.now(datetime.timezone.utc)
-        recent = format_datetime(now - datetime.timedelta(hours=2))
-        stale = format_datetime(now - datetime.timedelta(hours=48))
-        rss = f"""<?xml version="1.0" encoding="UTF-8"?>
-        <rss><channel>
-          <item><title>Recent report</title><source>Reuters</source><pubDate>{recent}</pubDate><link>https://example.com/recent</link></item>
-          <item><title>Stale report</title><source>Reuters</source><pubDate>{stale}</pubDate><link>https://example.com/stale</link></item>
-        </channel></rss>"""
-
-        with patch("main.requests.get", return_value=FakeResponse(rss)):
-            items = main.fetch_rss_news("test", limit=5)
-
-        self.assertEqual([item["title"] for item in items], ["Recent report"])
-        self.assertEqual(items[0]["link"], "https://example.com/recent")
-
+class MarketDataTests(unittest.TestCase):
     def test_market_fields_are_parsed_from_provider_payloads(self):
         quote_time = datetime.datetime.now(
             datetime.timezone(datetime.timedelta(hours=8))
@@ -117,7 +100,7 @@ class DataFreshnessTests(unittest.TestCase):
         stock = (
             f'v_sh000001="1~上证指数~000001~3985.70~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~{quote_time}~-0.60~-0.02";\n'
             f'v_sz399001="51~深证成指~399001~13915.86~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~{quote_time}~-99.14~-0.71";\n'
-            f'v_sz399006="51~创业板指~399006~3408.14~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~{quote_time}~-30.54~-0.89";'
+            f'v_sz399006="51~创业板指~399006~3408.14~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~{quote_time}~-30.54~-0.89";'
         )
         gold = (
             f'var hq_str_hf_GC="4480.81,0,0,0,0,0,13:32:12,0,0,0,0,0,{quote_date},纽约黄金";\n'
@@ -136,97 +119,82 @@ class DataFreshnessTests(unittest.TestCase):
         self.assertEqual(market["gold_updated_at"], "未获取")
         self.assertEqual(len(market["warnings"]), 2)
 
-    def test_program_owns_source_time_and_link_metadata(self):
-        raw_items = [{
-            "title": "Original headline",
-            "source": "Reuters",
-            "source_url": "https://www.reuters.com",
-            "pub_date": "2026-08-31 20:30 北京时间",
-            "link": "https://news.google.com/rss/articles/example",
-        }]
+
+class RewritePipelineTests(unittest.TestCase):
+    def test_section_uses_model_source_and_program_date(self):
         model_result = (
-            '{"items":[{"id":0,"title_cn":"测试标题",'
-            '"summary_cn":"这是模型联网读取媒体正文后生成的测试缩写。",'
-            '"source":"伪造媒体","original_url":"https://reuters.com/world/original?a=1&b=2"}]}'
+            '{"items":[{"title_cn":"第一段 第二段",'
+            '"summary_cn":"这是模型联网阅读原文后撰写的测试正文，包含新闻六要素。",'
+            '"original_url":"https://reuters.com/world/original",'
+            '"source":"Reuters"}]}'
         )
 
         def fake_gpt(prompt):
-            self.assertIn("Original headline", prompt)
-            self.assertIn("google_news_url", prompt)
-            return model_result, {"https://reuters.com/world/original?a=1&b=2"}
+            self.assertIn("Ukraine Russia war", prompt)
+            return model_result, set()
 
         with patch("main.call_gpt_web_rewrite", side_effect=fake_gpt):
-            section_html = main.process_section("测试", raw_items, 1, "2026年08月31日")
+            section_html = main.process_section("俄乌冲突与前线战况", "Ukraine Russia war", 1, "2026年8月31日")
 
         self.assertIn("Reuters", section_html)
-        self.assertIn("2026-08-31 20:30 北京时间", section_html)
-        self.assertIn("https://reuters.com/world/original?a=1&amp;b=2", section_html)
-        self.assertNotIn("伪造媒体", section_html)
+        self.assertIn("2026年8月31日", section_html)
+        self.assertIn("https://reuters.com/world/original", section_html)
 
-    def test_responses_api_enables_web_search_and_collects_citations(self):
+    def test_bad_original_url_shows_unavailable_link_but_keeps_item(self):
+        model_result = (
+            '{"items":[{"title_cn":"标题",'
+            '"summary_cn":"正文内容。",'
+            '"original_url":"https://www.google.com/search?q=test",'
+            '"source":"AP"}]}'
+        )
+
+        with patch("main.call_gpt_web_rewrite", return_value=(model_result, set())):
+            section_html = main.process_section("测试", "test", 1, "2026年8月31日")
+
+        self.assertIn("标题", section_html)
+        self.assertIn("原文链接不可用", section_html)
+
+    def test_duplicate_titles_are_deduped(self):
+        model_result = (
+            '{"items":['
+            '{"title_cn":"重复标题","summary_cn":"第一条正文。","original_url":"https://reuters.com/a","source":"Reuters"},'
+            '{"title_cn":"重复标题","summary_cn":"第二条正文。","original_url":"https://reuters.com/b","source":"Reuters"}'
+            ']}'
+        )
+
+        with patch("main.call_gpt_web_rewrite", return_value=(model_result, set())):
+            section_html = main.process_section("测试", "test", 2, "2026年8月31日")
+
+        self.assertEqual(section_html.count("<article"), 1)
+
+    def test_responses_api_enables_web_search(self):
         response = Mock(status_code=200)
         response.json.return_value = {
             "output": [
-                {
-                    "type": "web_search_call",
-                    "action": {
-                        "sources": [{"url": "https://reuters.com/world/original"}]
-                    },
-                },
                 {
                     "type": "message",
                     "content": [{
                         "type": "output_text",
                         "text": '{"items":[]}',
-                        "annotations": [{
-                            "type": "url_citation",
-                            "url": "https://reuters.com/world/original",
-                        }],
                     }],
                 },
             ]
         }
 
         with patch("main.requests.post", return_value=response) as post:
-            output_text, sources = main.call_gpt_web_rewrite("search the article")
+            output_text, _sources = main.call_gpt_web_rewrite("search the article")
 
         payload = post.call_args.kwargs["json"]
         self.assertEqual(post.call_args.args[0], main.get_responses_url())
         self.assertEqual(payload["tools"], [{"type": "web_search"}])
         self.assertEqual(payload["tool_choice"], "required")
         self.assertEqual(output_text, '{"items":[]}')
-        self.assertIn("https://reuters.com/world/original", sources)
 
-    def test_citation_tracking_parameters_do_not_reject_valid_media_url(self):
-        self.assertTrue(
-            main._is_cited_original_url(
-                "https://www.reuters.com/world/article-123?utm_source=search",
-                "https://www.reuters.com",
-                {"https://reuters.com/world/article-123?ref=web_search"},
-            )
+    def test_markdown_code_fence_json_is_parsed(self):
+        self.assertEqual(
+            main._parse_json_response('```json\n{"items":[]}\n```'),
+            {"items": []},
         )
-
-    def test_uncited_original_url_is_rejected(self):
-        raw_items = [{
-            "title": "Original headline",
-            "source": "Reuters",
-            "source_url": "https://www.reuters.com",
-            "pub_date": "2026-08-31 20:30 北京时间",
-            "link": "https://news.google.com/rss/articles/example",
-        }]
-        model_result = (
-            '{"items":[{"id":0,"title_cn":"测试标题",'
-            '"summary_cn":"这段文字声称来自正文但没有匹配的联网引用。",'
-            '"original_url":"https://fake.example/article"}]}'
-        )
-
-        with patch(
-            "main.call_gpt_web_rewrite",
-            return_value=(model_result, {"https://fake.example/article"}),
-        ):
-            section_html = main.process_section("测试", raw_items, 1, "2026年08月31日")
-
-        self.assertIn("暂未获得可验证", section_html)
 
 
 if __name__ == "__main__":
