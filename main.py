@@ -27,12 +27,11 @@ def get_beijing_time():
     """获取当前准确的北京时间及前一天日期"""
     now = datetime.datetime.now(BEIJING_TZ)
     yesterday = now - datetime.timedelta(days=1)
-    
-    today_str = now.strftime("%Y年%m月%d日")
-    yesterday_str = yesterday.strftime("%Y年%m月%d日")
-    weekday_cn = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][yesterday.weekday()]
-    
-    return today_str, yesterday_str, weekday_cn
+
+    today_str = f"{now.year}年{now.month}月{now.day}日"
+    yesterday_str = f"{yesterday.year}年{yesterday.month}月{yesterday.day}日"
+
+    return today_str, yesterday_str
 
 
 def _parse_quoted_fields(line):
@@ -95,7 +94,7 @@ def fetch_realtime_market_data():
             if len(fields) <= 32:
                 raise ValueError(f"{identifier} 字段数量不足")
             quote_time = datetime.datetime.strptime(fields[30], "%Y%m%d%H%M%S").replace(tzinfo=BEIJING_TZ)
-            _ensure_fresh_quote(quote_time, max_age_hours=96)
+            _ensure_fresh_quote(quote_time, max_age_hours=240)
             key, name = index_map[identifier]
             parsed_indexes[key] = f"{name}：{float(fields[3]):.2f} 点（{float(fields[32]):+.2f}%）"
             quote_times.append(quote_time)
@@ -122,13 +121,13 @@ def fetch_realtime_market_data():
             if "hf_GC" in line and '"' in line:
                 fields = _parse_quoted_fields(line)
                 quote_time = _parse_market_datetime(fields[12], fields[6])
-                _ensure_fresh_quote(quote_time, max_age_hours=96)
+                _ensure_fresh_quote(quote_time, max_age_hours=240)
                 parsed_gold["gold_intl"] = f"{float(fields[0]):.2f} 美元/盎司"
                 gold_times.append(quote_time)
             elif "gds_AUTD" in line and '"' in line:
                 fields = _parse_quoted_fields(line)
                 quote_time = _parse_market_datetime(fields[12], fields[6])
-                _ensure_fresh_quote(quote_time, max_age_hours=96)
+                _ensure_fresh_quote(quote_time, max_age_hours=240)
                 parsed_gold["gold_cn"] = f"{float(fields[0]):.2f} 元/克"
                 gold_times.append(quote_time)
 
@@ -159,7 +158,7 @@ _SEARCH_PAGE_HOSTS = {"google.com", "news.google.com", "bing.com"}
 
 
 def _usable_original_url(url, fallback):
-    """只做链接卫生检查：拒绝搜索结果页与非法 URL，异常时回退到 RSS 链接。"""
+    """只做链接卫生检查：拒绝搜索结果页与非法 URL，异常时回退到 fallback。"""
     url = (url or "").strip()
     try:
         parsed = urlparse(url)
@@ -186,23 +185,10 @@ def _parse_json_response(text):
     return json.loads(text[start:end + 1])
 
 
-def _extract_response_text_and_sources(data):
+def _extract_response_text(data):
     text_parts = []
-    source_urls = set()
     if isinstance(data.get("output_text"), str):
         text_parts.append(data["output_text"])
-
-    def collect_urls(value):
-        if isinstance(value, dict):
-            if isinstance(value.get("url"), str):
-                source_urls.add(value["url"])
-            for nested in value.values():
-                collect_urls(nested)
-        elif isinstance(value, list):
-            for nested in value:
-                collect_urls(nested)
-
-    collect_urls(data)
     for output in data.get("output", []):
         if not isinstance(output, dict):
             continue
@@ -214,16 +200,39 @@ def _extract_response_text_and_sources(data):
     output_text = "\n".join(dict.fromkeys(text_parts)).strip()
     if not output_text:
         raise ValueError("Responses API 未返回 output_text")
-    return output_text, source_urls
+    return output_text
+
+
+_NEWS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title_cn": {"type": "string"},
+                    "summary_cn": {"type": "string"},
+                    "original_url": {"type": "string"},
+                    "source": {"type": "string"},
+                },
+                "required": ["title_cn", "summary_cn", "original_url", "source"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["items"],
+    "additionalProperties": False,
+}
 
 
 def call_gpt_web_rewrite(prompt):
-    """通过 Responses API 让模型联网检索并阅读媒体原文后缩写。"""
+    """通过 Responses API 让模型联网检索并阅读媒体原文后撰写。"""
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
-    payload = {
+    base_payload = {
         "model": OPENAI_MODEL,
         "instructions": (
             "你是一名严谨的中文国际新闻编辑。对每条候选必须使用 web_search 搜索"
@@ -232,34 +241,48 @@ def call_gpt_web_rewrite(prompt):
         "input": prompt,
         "tools": [{"type": "web_search"}],
         "tool_choice": "required",
-        "include": ["web_search_call.action.sources"],
     }
+    payload_variants = [
+        {
+            **base_payload,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "news_digest",
+                    "schema": _NEWS_SCHEMA,
+                    "strict": True,
+                }
+            },
+        },
+        base_payload,
+    ]
 
     last_error = "未知错误"
-    for attempt in range(3):
-        try:
-            response = requests.post(
-                get_responses_url(),
-                headers=headers,
-                json=payload,
-                timeout=240,
-            )
-            if response.status_code == 200:
-                return _extract_response_text_and_sources(response.json())
+    for payload in payload_variants:
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    get_responses_url(),
+                    headers=headers,
+                    json=payload,
+                    timeout=240,
+                )
+                if response.status_code == 200:
+                    return _extract_response_text(response.json())
 
-            last_error = f"HTTP {response.status_code}: {response.text[:300]}"
-            if response.status_code != 429 and response.status_code < 500:
-                break
-        except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
-            last_error = str(exc)
+                last_error = f"HTTP {response.status_code}: {response.text[:300]}"
+                if response.status_code != 429 and response.status_code < 500:
+                    break
+            except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
+                last_error = str(exc)
 
-        if attempt < 2:
-            time.sleep(2 ** attempt)
+            if attempt < 2:
+                time.sleep(2 ** attempt)
 
     raise RuntimeError(f"调用 {OPENAI_MODEL} 联网改写失败：{last_error}")
 
 
-def process_section(section_name, search_query, target_count, yesterday_str):
+def process_section(section_name, search_query, target_count, yesterday_str, seen_titles=None):
     """让模型用 web_search 自主搜索并撰写；来源由模型返回，日期由程序填写。"""
     output_count = max(int(target_count), 1)
     print(f"正在撰写板块：{section_name}（目标 {output_count} 条）...")
@@ -283,10 +306,14 @@ def process_section(section_name, search_query, target_count, yesterday_str):
     """
 
     try:
-        response_text, _ = call_gpt_web_rewrite(prompt)
+        response_text = call_gpt_web_rewrite(prompt)
         result = _parse_json_response(response_text)
     except (RuntimeError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         print(f"{section_name} 搜索或结果解析失败：{exc}")
+        return '<p style="color:#888;">本板块暂未获得可验证的新闻。</p>'
+
+    if not isinstance(result, dict):
+        print(f"{section_name} 的模型结果不是 JSON 对象")
         return '<p style="color:#888;">本板块暂未获得可验证的新闻。</p>'
 
     rewritten_items = result.get("items")
@@ -294,8 +321,10 @@ def process_section(section_name, search_query, target_count, yesterday_str):
         print(f"{section_name} 的模型结果缺少 items 数组")
         return '<p style="color:#888;">本板块暂未获得可验证的新闻。</p>'
 
+    if seen_titles is None:
+        seen_titles = set()
+
     html_items = []
-    seen_titles = set()
     for rewritten in rewritten_items:
         if not isinstance(rewritten, dict):
             continue
@@ -335,7 +364,7 @@ def process_section(section_name, search_query, target_count, yesterday_str):
 BATCH_SIZE = 4
 
 
-def process_section_batched(section_name, search_queries, target_count, yesterday_str):
+def process_section_batched(section_name, search_queries, target_count, yesterday_str, seen_titles=None):
     """分批让模型搜索并撰写，每批最多 BATCH_SIZE 条，避免单次请求过重超时。"""
     remaining = max(int(target_count), 0)
     parts = []
@@ -343,13 +372,37 @@ def process_section_batched(section_name, search_queries, target_count, yesterda
         if remaining <= 0:
             break
         batch = min(BATCH_SIZE, remaining)
-        parts.append(process_section(section_name, query, batch, yesterday_str))
+        part = process_section(section_name, query, batch, yesterday_str, seen_titles)
+        if "<article" in part:
+            parts.append(part)
         remaining -= batch
     content = "".join(parts)
     return content or '<p style="color:#888;">本板块暂未获得可验证的新闻。</p>'
 
 
-def build_final_html(today_str, yesterday_str, sections_data, market_data):
+HISTORY_FILE = "history.json"
+
+
+def load_history():
+    """读取历史已推送标题，用于跨天去重。"""
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {str(t) for t in data.get("titles", []) if isinstance(t, str)}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return set()
+
+
+def save_history(seen_titles):
+    """把本次已推送标题写回历史文件，最多保留最近 500 条。"""
+    if not seen_titles:
+        return
+    merged = sorted(seen_titles)[-500:]
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump({"titles": merged}, f, ensure_ascii=False, indent=2)
+
+
+def build_final_html(sections_data, market_data):
     """流水线组装：将所有写好的板块与真实金融行情拼接为完整 HTML"""
     html_parts = []
     
@@ -400,8 +453,7 @@ def build_final_html(today_str, yesterday_str, sections_data, market_data):
     
     return "".join(html_parts)
 
-def send_to_pushplus(html_content):
-    today_str, _, _ = get_beijing_time()
+def send_to_pushplus(html_content, today_str):
     title = f"每日新闻简报 - {today_str}"
     
     url = "https://www.pushplus.plus/send"
@@ -414,6 +466,12 @@ def send_to_pushplus(html_content):
     resp = requests.post(url, json=data, timeout=30)
     if resp.status_code != 200:
         raise RuntimeError(f"PushPlus 推送失败：HTTP {resp.status_code}")
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {}
+    if body.get("code", 200) != 200:
+        raise RuntimeError(f"PushPlus 推送失败：{resp.text}")
     print("PushPlus 微信推送响应:", resp.text)
 
 def main():
@@ -430,7 +488,7 @@ def main():
         print(f"错误：缺少环境变量：{', '.join(missing_vars)}")
         sys.exit(1)
 
-    today_str, yesterday_str, _ = get_beijing_time()
+    today_str, yesterday_str = get_beijing_time()
     print(f"启动自动化流水线：今日基准 {today_str}，目标新闻日期 {yesterday_str}，模型 {OPENAI_MODEL}")
 
     # 1. 获取当日金价与 A 股行情
@@ -439,21 +497,22 @@ def main():
 
     # 2. 让模型自主搜索并撰写新闻（世界板块作为弹性填充，确保总数达到 20 条）
     sections_data = {}
-    sections_data["一、俄乌冲突与前线战况"] = process_section("俄乌冲突与前线战况", "Ukraine Russia war", 4, yesterday_str)
-    sections_data["二、美以伊局势与中东战事"] = process_section("美以伊局势与中东战事", "Israel Iran Gaza", 3, yesterday_str)
-    sections_data["三、人工智能与大模型前沿"] = process_section("人工智能与大模型前沿", "artificial intelligence OpenAI Anthropic", 3, yesterday_str)
+    seen_titles = load_history()
+    sections_data["一、俄乌冲突与前线战况"] = process_section("俄乌冲突与前线战况", "Ukraine Russia war", 4, yesterday_str, seen_titles)
+    sections_data["二、美以伊局势与中东战事"] = process_section("美以伊局势与中东战事", "Israel Iran Gaza", 3, yesterday_str, seen_titles)
+    sections_data["三、人工智能与大模型前沿"] = process_section("人工智能与大模型前沿", "artificial intelligence OpenAI Anthropic", 3, yesterday_str, seen_titles)
 
     done_count = sum(s.count("<article") for s in sections_data.values())
     world_target = max(20 - done_count, 0)
     world_queries = [
-        "world news politics economy",
-        "world news science technology climate",
+        "world news politics economy excluding Ukraine Russia Israel Iran Gaza artificial intelligence",
+        "world news science technology climate excluding artificial intelligence",
         "world news business energy market",
         "world news society culture health",
         "world news international affairs diplomacy",
     ]
     sections_data["四、全球综合重大新闻"] = process_section_batched(
-        "全球综合重大新闻", world_queries, world_target, yesterday_str
+        "全球综合重大新闻", world_queries, world_target, yesterday_str, seen_titles
     )
 
     total_articles = sum(s.count("<article") for s in sections_data.values())
@@ -461,10 +520,11 @@ def main():
 
     # 3. 组装并推送
     print("正在组装新闻简报与金融行情 HTML...")
-    final_html = build_final_html(today_str, yesterday_str, sections_data, market_data)
+    final_html = build_final_html(sections_data, market_data)
 
     print("正在推送到微信...")
-    send_to_pushplus(final_html)
+    send_to_pushplus(final_html, today_str)
+    save_history(seen_titles)
     print("流水线执行成功，微信已成功收到推送！")
 
 if __name__ == "__main__":

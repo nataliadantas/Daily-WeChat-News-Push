@@ -43,8 +43,8 @@ class MarketDataTests(unittest.TestCase):
             f'v_sz399006="51~创业板指~399006~3408.14~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~{quote_time}~-30.54~-0.89";'
         )
         gold = (
-            f'var hq_str_hf_GC="4480.81,0,0,0,0,0,13:32:12,0,0,0,0,0,{quote_date},纽约黄金";\n'
-            f'var hq_str_gds_AUTD="958.37,0,0,0,0,0,13:32:12,0,0,0,0,0,{quote_date},黄金延期";'
+            f'var hq_str_hf_GC="4480.81,0,0,0,0,0,{quote_time[8:10]}:{quote_time[10:12]}:{quote_time[12:14]},0,0,0,0,0,{quote_date},纽约黄金";\n'
+            f'var hq_str_gds_AUTD="958.37,0,0,0,0,0,{quote_time[8:10]}:{quote_time[10:12]}:{quote_time[12:14]},0,0,0,0,0,{quote_date},黄金延期";'
         )
 
         def fake_get(url, **_kwargs):
@@ -76,8 +76,8 @@ class MarketDataTests(unittest.TestCase):
             f'v_sh000001="1~上证指数~000001~3985.70~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~{quote_time}~-0.60~-0.02";'
         )
         gold = (
-            f'var hq_str_hf_GC="4480.81,0,0,0,0,0,13:32:12,0,0,0,0,0,{quote_date},纽约黄金";\n'
-            f'var hq_str_gds_AUTD="958.37,0,0,0,0,0,13:32:12,0,0,0,0,0,{quote_date},黄金延期";'
+            f'var hq_str_hf_GC="4480.81,0,0,0,0,0,{quote_time[8:10]}:{quote_time[10:12]}:{quote_time[12:14]},0,0,0,0,0,{quote_date},纽约黄金";\n'
+            f'var hq_str_gds_AUTD="958.37,0,0,0,0,0,{quote_time[8:10]}:{quote_time[10:12]}:{quote_time[12:14]},0,0,0,0,0,{quote_date},黄金延期";'
         )
 
         def fake_get(url, **_kwargs):
@@ -103,8 +103,8 @@ class MarketDataTests(unittest.TestCase):
             f'v_sz399006="51~创业板指~399006~3408.14~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~{quote_time}~-30.54~-0.89";'
         )
         gold = (
-            f'var hq_str_hf_GC="4480.81,0,0,0,0,0,13:32:12,0,0,0,0,0,{quote_date},纽约黄金";\n'
-            f'var hq_str_gds_AUTD="958.37,0,0,0,0,0,13:32:12,0,0,0,0,0,{quote_date},黄金延期";'
+            f'var hq_str_hf_GC="4480.81,0,0,0,0,0,{quote_time[8:10]}:{quote_time[10:12]}:{quote_time[12:14]},0,0,0,0,0,{quote_date},纽约黄金";\n'
+            f'var hq_str_gds_AUTD="958.37,0,0,0,0,0,{quote_time[8:10]}:{quote_time[10:12]}:{quote_time[12:14]},0,0,0,0,0,{quote_date},黄金延期";'
         )
 
         def fake_get(url, **_kwargs):
@@ -131,7 +131,7 @@ class RewritePipelineTests(unittest.TestCase):
 
         def fake_gpt(prompt):
             self.assertIn("Ukraine Russia war", prompt)
-            return model_result, set()
+            return model_result
 
         with patch("main.call_gpt_web_rewrite", side_effect=fake_gpt):
             section_html = main.process_section("俄乌冲突与前线战况", "Ukraine Russia war", 1, "2026年8月31日")
@@ -148,7 +148,7 @@ class RewritePipelineTests(unittest.TestCase):
             '"source":"AP"}]}'
         )
 
-        with patch("main.call_gpt_web_rewrite", return_value=(model_result, set())):
+        with patch("main.call_gpt_web_rewrite", return_value=model_result):
             section_html = main.process_section("测试", "test", 1, "2026年8月31日")
 
         self.assertIn("标题", section_html)
@@ -162,7 +162,7 @@ class RewritePipelineTests(unittest.TestCase):
             ']}'
         )
 
-        with patch("main.call_gpt_web_rewrite", return_value=(model_result, set())):
+        with patch("main.call_gpt_web_rewrite", return_value=model_result):
             section_html = main.process_section("测试", "test", 2, "2026年8月31日")
 
         self.assertEqual(section_html.count("<article"), 1)
@@ -182,7 +182,7 @@ class RewritePipelineTests(unittest.TestCase):
         }
 
         with patch("main.requests.post", return_value=response) as post:
-            output_text, _sources = main.call_gpt_web_rewrite("search the article")
+            output_text = main.call_gpt_web_rewrite("search the article")
 
         payload = post.call_args.kwargs["json"]
         self.assertEqual(post.call_args.args[0], main.get_responses_url())
@@ -202,6 +202,18 @@ class RewritePipelineTests(unittest.TestCase):
 
         self.assertEqual(ps.call_count, 3)
         self.assertEqual(html.count("<article>"), 3)
+
+    def test_shared_seen_titles_dedupes_across_calls(self):
+        seen = set()
+        m1 = '{"items":[{"title_cn":"共享标题","summary_cn":"第一条正文。","original_url":"https://reuters.com/a","source":"Reuters"}]}'
+        m2 = '{"items":[{"title_cn":"共享标题","summary_cn":"第二条正文。","original_url":"https://reuters.com/b","source":"Reuters"}]}'
+
+        with patch("main.call_gpt_web_rewrite", side_effect=[m1, m2]):
+            html_one = main.process_section("板块一", "q1", 1, "2026年8月31日", seen)
+            html_two = main.process_section("板块二", "q2", 1, "2026年8月31日", seen)
+
+        self.assertEqual(html_one.count("<article"), 1)
+        self.assertEqual(html_two.count("<article"), 0)
 
 
 if __name__ == "__main__":
